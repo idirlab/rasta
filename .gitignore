@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+quickstart_adapter*/
+*.pt
+.DS_Store
+results_*/
+*results_math*/
+paper_reports/
+analysis/out/
+*.log
+merged/
+hf_checkpoints/

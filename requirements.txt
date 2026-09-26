@@ -1,0 +1,21 @@
+# core
+torch>=2.1
+transformers>=4.44
+accelerate>=0.30          # required by the HF Trainer used in all trainers
+datasets>=2.19
+peft>=0.11                # LoRA / VeRA baselines
+numpy
+tqdm
+sentencepiece             # Llama-2 / Mistral tokenizers
+protobuf
+
+# evaluation
+evaluate                  # GLUE metrics
+
+# analysis figures / reports
+matplotlib
+safetensors               # reading peft checkpoints in analysis
+
+# optional but recommended: fastest attention backend; the trainers
+# fall back automatically to sdpa if it is not installed
+# flash-attn>=2.5   (pip install flash-attn --no-build-isolation)
