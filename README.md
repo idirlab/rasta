@@ -1,23 +1,28 @@
 # RaSTA: Random Subspace Tuning Adaptation
 
 Official implementation of **RaSTA** (**Ra**ndom **S**ubspace **T**uning **A**daptation), a
-parameter-efficient fine-tuning method that learns a small mixing core between **frozen random
-bases shared across layers**. RaSTA's trainable budget is decoupled from layer width: at its
-largest setting it uses *under half* the parameters of rank-one LoRA, and it stays competitive
-with LoRA down to roughly a tenth of that.
+parameter-efficient fine-tuning method that adapts a frozen weight by **learning how to mix
+directions inside fixed random subspaces**, rather than learning the subspaces themselves.
+The left and right subspaces are spanned by frozen random bases shared across layers; only a
+small mixing core between them is trained, and its size is set independently of the layer's
+dimensions.
 
 > **RaSTA: Random Subspace Tuning Adaptation** — [paper link TBD]
 
-**Highlights**
+**What is specific to RaSTA**
 
-- 🧊 **Frozen, shared, seed-regenerable bases.** No per-weight SVD, no bases in the checkpoint —
-  adapters store only the learned core (≈1M scalars for a 7–8B model at ρ = 1).
-- 🔀 **Two variants, one knob.** RaSTA-HS (Hadamard scaling, our main variant) and RaSTA-DM
-  (dense mixing), both sized by a single compression hyperparameter `ρ`.
-- 🪶 **Low memory.** Trains at sequence length 2048 on an 80 GiB GPU where full fine-tuning,
-  every LoRA rank, and VeRA run out of memory.
-- ⚡ **No inference overhead.** The update merges into the base weight; merged models are
-  plain `nn.Linear`.
+- **Learned mixing inside shared random subspaces.** RaSTA combines the mixing-core structure of
+  LoRA-XS with the shared frozen random bases of VeRA. No per-weight SVD is needed, and the bases
+  are regenerated from seeds, so an adapter checkpoint holds only the learned core.
+- **A Walsh–Hadamard mixing core (RaSTA-HS).** A fixed Hadamard matrix couples every left basis
+  direction with every right one, and only two scaling vectors around it are learned. This lets
+  a tiny budget reach many more directions than a dense learned core. To our knowledge this is
+  the first use of the Walsh–Hadamard transform inside the mixing core of a frozen-basis adapter.
+- **A size-aware budget decoupled from layer width.** One hyperparameter `ρ` gives each
+  `m×n` weight about `√(mn)/ρ` trainable parameters, instead of the `r(m+n)` that LoRA ties to
+  the layer's dimensions.
+- **Budget-stabilized update scaling.** Setting `γ = √ρ` keeps optimization comparable across
+  budgets, so one learning rate per variant works at every `ρ`.
 
 ---
 
@@ -31,172 +36,185 @@ How each method factorizes the additive update to a frozen weight W (m×n).
 Frozen components in blue, trainable in orange.
 </em></p>
 
-RaSTA expresses the update to a frozen pretrained weight $W \in \mathbb{R}^{m\times n}$ as
+### General form
 
-$$
-\Delta W \;=\; \gamma \, B_L \, \tilde{M} \, B_R^{\top},
-$$
+For a frozen pretrained weight $`W \in \mathbb{R}^{m \times n}`$, RaSTA learns the additive update
 
-where $B_L \in \mathbb{R}^{m\times k}$ and $B_R \in \mathbb{R}^{n\times k}$ are frozen random
-Gaussian bases (unit-norm columns) that fix the available left and right directions,
-$\tilde{M}$ is a small **mixing core** — entry $\tilde{M}_{ij}$ weights the outer product of the
-$i$-th left and $j$-th right basis vector — and $\gamma$ is a fixed update scale. Where LoRA
-learns *which* row and column spaces to update, RaSTA keeps those spaces fixed and random, and
-learns only *how to combine* directions inside them. The two variants differ in how they spend
-the parameter budget on $\tilde{M}$.
+```math
+\Delta W = \gamma B_L \tilde{M} B_R^{\top}
+```
 
-### RaSTA-HS — Hadamard scaling (main variant)
+- $`B_L \in \mathbb{R}^{m \times k}`$ and $`B_R \in \mathbb{R}^{n \times k}`$ are **frozen random
+  Gaussian bases** with unit-norm columns. They fix the left and right directions the update can
+  use, and are shared by all layers with the same basis shape.
+- $`\tilde{M}`$ is the **mixing core**. Entry $`\tilde{M}_{ij}`$ weights the outer product of the
+  $`i`$-th left and the $`j`$-th right basis vector, so the core decides how the available
+  directions interact.
+- $`\gamma`$ is a fixed update scale (see [Update scaling](#update-scaling)).
 
-$$
-\tilde{M} \;=\; \operatorname{diag}(s_L)\; H_V \;\operatorname{diag}(s_R),
-\qquad s_L, s_R \in \mathbb{R}^{V}\ \ (2V \text{ trainable parameters})
-$$
+LoRA learns the row and column spaces of its update. RaSTA keeps those spaces fixed and random
+and learns only the combination of directions inside them. The two RaSTA variants differ in how
+the core spends its parameter budget.
 
-The core is a **fixed** normalized Walsh–Hadamard matrix $H_V$ sandwiched between two
-**learned** diagonal scalings. Each core entry is $\tilde{M}_{ij} = s_{L,i}\,(H_V)_{ij}\,s_{R,j}$,
-so:
+### How the methods differ structurally
 
-- **Every left direction is coupled to every right direction.** $H_V$ is dense with
-  equal-magnitude entries $\pm 1/\sqrt{V}$, so all $V^2$ direction pairs interact with the same
-  strength before the learned scalings act. Contrast VeRA, whose core is *diagonal*: left
-  direction $i$ only ever pairs with right direction $i$.
-- **The mixing is uniform and non-redundant.** $H_V$ is orthogonal ($H_V H_V^\top = I$), so the
-  scalings act on a well-conditioned set of directions rather than a few dominant ones.
-- **Many directions for very few parameters.** Because only $2V$ scalars are learned, $V$ can be
-  large (e.g. 1024 on a 4096×4096 layer), and since $H_V$ is full-rank the update can reach rank
-  up to $V$ — versus rank $r$ for LoRA or $k$ for dense-core methods at a similar budget.
-- **No dense matrix is stored or multiplied.** $H_V$ is applied with the fast Walsh–Hadamard
-  transform in $\mathcal{O}(V \log V)$, via a fused CUDA kernel when available.
+| Method | Update $`\Delta W`$ | Learned | Frozen bases | Core structure | Params per matrix |
+|---|---|---|---|---|---|
+| LoRA | $`BA`$ | $`B, A`$ | none (factors are learned) | none | $`r(m+n)`$ |
+| VeRA | $`\mathrm{diag}(s_L) B_L \mathrm{diag}(s_R) B_R^{\top}`$ | $`s_L, s_R`$ | shared random | diagonal: direction $`i`$ pairs only with direction $`i`$ | $`m + V`$ |
+| LoRA-XS | $`B_L M B_R^{\top}`$ | $`M`$ | per-weight truncated SVD | dense, fully learned | $`k^2`$ |
+| RaSTA-DM | $`\gamma B_L M B_R^{\top}`$ | $`M`$ | shared random | dense, fully learned | $`k^2`$ |
+| **RaSTA-HS** | $`\gamma B_L \mathrm{diag}(s_L) H_V \mathrm{diag}(s_R) B_R^{\top}`$ | $`s_L, s_R`$ | shared random | dense, fixed Hadamard coupling with learned scalings | $`2V`$ |
 
-Initialization: $s_L = 0$ and $s_R \sim \mathcal{N}(0, 0.01^2)$, so $\Delta W = 0$ at the start of
-training. To our knowledge this is the first use of the Walsh–Hadamard transform *inside the
-mixing core* of a frozen-basis adapter (prior work uses fixed transforms over a weight's
-coordinates to synthesize updates from sparse spectra).
+The frozen-basis methods can be read as points on one axis: how the core couples left and right
+directions. VeRA's core is diagonal. RaSTA-HS keeps a dense but fixed coupling and learns only
+per-direction scalings. RaSTA-DM and LoRA-XS learn every coupling. RaSTA-DM and LoRA-XS share the
+same structure and differ only in the bases; they perform comparably on average in our
+experiments, which suggests that spectral bases are not necessary for this family.
 
-### RaSTA-DM — dense mixing
+### The Walsh–Hadamard matrix
 
-$$
-\tilde{M} \;=\; M \in \mathbb{R}^{k\times k}\qquad (k^2 \text{ trainable parameters, } M \text{ initialized to } 0)
-$$
+The normalized Walsh–Hadamard matrix of power-of-two order is built by the Sylvester recursion
 
-Every entry of the core is learned: unrestricted pairwise interactions, but among far fewer
-directions. RaSTA-DM shares LoRA-XS's dense-core structure and differs **only** in the bases —
-shared random instead of a truncated SVD of each weight ($B_L = U_k\Sigma_k$, $B_R = V_k$).
-In our experiments the two perform comparably on average, suggesting spectral bases are not
-necessary for this family.
+```math
+H_{2n} = \frac{1}{\sqrt{2}} \begin{pmatrix} H_n & H_n \\ H_n & -H_n \end{pmatrix}
+```
 
-### The expressivity–coverage trade-off
+starting from $`H_1 = [1]`$. Every entry is $`\pm 1/\sqrt{n}`$, and its rows are mutually
+orthogonal, so $`H_n H_n^{\top} = I_n`$. Because of the recursive structure, multiplying by
+$`H_n`$ (the Walsh–Hadamard transform) takes $`O(n \log n)`$ operations with the fast
+Walsh–Hadamard transform, and the matrix never has to be stored.
 
-The core structures form a spectrum: diagonal (VeRA) → fixed dense coupling with learned
-scalings (RaSTA-HS) → fully learned dense coupling (RaSTA-DM / LoRA-XS). At a matched budget,
-RaSTA-DM buys **expressivity** (free mixing of a few directions) while RaSTA-HS buys
-**coverage** (structured mixing across many). Concretely, for a 4096×4096 layer:
+These properties are why RaSTA-HS uses it as the fixed factor of its core:
 
-| Method | Update $\Delta W$ | Trainable | Bases | Params (per matrix) | Directions / side | 4096×4096 example |
-|---|---|---|---|---|---|---|
-| LoRA | $BA$ | $B, A$ | learned | $r(m+n)$ | $r$ | r = 1 → **8,192** params, rank 1 |
-| VeRA | $\operatorname{diag}(s_L) B_L \operatorname{diag}(s_R) B_R^\top$ | $s_L, s_R$ | shared random | $m + V$ | $V$ | V = 1024 → **5,120** params |
-| LoRA-XS | $B_L M B_R^\top$ | $M$ | per-weight SVD | $k^2$ | $k$ | ρ = 2 → **2,025** params, 45 dirs |
-| RaSTA-DM | $\gamma B_L M B_R^\top$ | $M$ | shared random | $k^2$ | $k$ | ρ = 2 → **2,025** params, 45 dirs |
-| **RaSTA-HS** | $\gamma B_L \operatorname{diag}(s_L) H_V \operatorname{diag}(s_R) B_R^\top$ | $s_L, s_R$ | shared random | $2V$ | $V$ | ρ = 2 → **2,048** params, 1024 dirs |
+- **Equal-magnitude entries** mean every left–right direction pair is coupled with the same
+  strength before the learned scalings act, so no pair is privileged by the fixed factor.
+- **Orthogonal rows** mean the mixed directions are equally weighted and none is a linear
+  combination of the others.
+- **A fast implicit transform** gives dense mixing with no stored matrix, no extra trainable
+  parameters, and near-linear cost in $`V`$.
 
-### Two design choices
+### RaSTA-HS: Hadamard scaling
 
-**Size-aware budget `ρ`.** Each $m\times n$ weight gets $\approx \sqrt{mn}/\rho$ trainable
-parameters, so larger layers get more parameters (as LoRA does implicitly) and one knob sizes the
-whole model. Larger `ρ` = smaller adapter. The widths are
+```math
+\tilde{M} = \mathrm{diag}(s_L) H_V \mathrm{diag}(s_R)
+```
 
-$$
-k = \Big\lfloor \big(\sqrt{mn}/\rho\big)^{1/2} \Big\rfloor,
-\qquad
-V = \min\!\Big(2^{\,\mathrm{round}(\log_2 \frac{\sqrt{mn}}{2\rho})},\; 2^{\lfloor \log_2 \min(m,n)\rfloor}\Big),
-$$
+Only the two scaling vectors $`s_L, s_R \in \mathbb{R}^{V}`$ are learned, which is $`2V`$
+parameters for $`V`$ directions per side. Each core entry is
+$`\tilde{M}_{ij} = s_{L,i} (H_V)_{ij} s_{R,j}`$: the Hadamard matrix supplies the pattern of
+interactions, and the scalings control how much each left and right direction contributes.
 
-giving $k^2 \approx 2V \approx \sqrt{mn}/\rho$. $V$ is a power of two (required by $H_V$) and
-capped so directions never outnumber the layer's rank. At ρ = 1 the budget is
-$\sqrt{mn} \le (m+n)/2$ — at most half of rank-one LoRA.
+Because the learned part grows only linearly in $`V`$, RaSTA-HS can afford a much wider subspace
+than a dense core at the same budget. Since $`H_V`$ is full-rank, the core itself is full-rank
+whenever the scalings are nonzero, so the update is not limited to a handful of directions.
 
-**Update scaling `γ = √ρ`.** Shrinking the budget also shrinks the magnitude of the unscaled
-update; $\gamma = \sqrt{\rho}$ compensates, so a **single learning rate per variant works at every
-budget** (analogous in spirit to rank-stabilized LoRA). With scaling, loss curves at different ρ
-become near-parallel; without it, larger ρ trains visibly slower — especially for RaSTA-DM:
+At initialization $`s_L = 0`$ and the entries of $`s_R`$ are drawn from
+$`\mathcal{N}(0, 0.01^2)`$, so $`\Delta W = 0`$ at the start of training.
+
+### RaSTA-DM: dense mixing
+
+```math
+\tilde{M} = M \in \mathbb{R}^{k \times k}
+```
+
+Every entry of the core is learned, which is $`k^2`$ parameters for $`k`$ directions per side,
+with $`M`$ initialized to zero. This gives unrestricted pairwise interactions, but among far fewer
+directions.
+
+### Expressivity versus coverage
+
+At a matched budget $`k^2 \approx 2V`$, the two variants make opposite choices. RaSTA-DM spends
+the budget on **expressivity**: free mixing among $`k`$ directions. RaSTA-HS spends it on
+**coverage**: structured mixing across $`V`$ directions, with $`V`$ much larger than $`k`$. For a
+4096×4096 layer at `ρ = 2`, nearly the same budget buys either free mixing among 45 directions
+(RaSTA-DM, 2025 parameters) or Hadamard-structured mixing across 1024 directions (RaSTA-HS,
+2048 parameters).
+
+### Size-aware budget
+
+Since the basis widths are not tied to the layer's dimensions, a single compression
+hyperparameter `ρ` sets them. Each $`m \times n`$ weight gets a target budget of
+$`\sqrt{mn}/\rho`$, which allocates more parameters to larger layers in proportion to the
+geometric mean of their dimensions. The widths are
+
+```math
+k = \left\lfloor \sqrt{\frac{\sqrt{mn}}{\rho}} \right\rfloor
+```
+
+```math
+V = \min\left( 2^{\mathrm{round}\left(\log_2 \frac{\sqrt{mn}}{2\rho}\right)}, 2^{\lfloor \log_2 \min(m, n) \rfloor} \right)
+```
+
+so that $`k^2 \approx 2V \approx \sqrt{mn}/\rho`$. $`V`$ is rounded to a power of two, as the
+Hadamard matrix requires, and capped so the directions cannot outnumber the layer's rank. Larger
+`ρ` gives a smaller adapter. At `ρ = 1` the budget is $`\sqrt{mn} \le (m+n)/2`$, at most half of
+rank-one LoRA.
+
+### Update scaling
+
+Increasing `ρ` shrinks the budget and also the magnitude of the unscaled update. RaSTA sets
+$`\gamma = \sqrt{\rho}`$ for both variants to compensate, analogous in spirit to rank-stabilized
+LoRA, so a single learning rate per variant can be used at every budget. With the scaling, loss
+curves at different budgets become near-parallel. Without it, smaller budgets train visibly
+slower, and RaSTA-DM is more sensitive than RaSTA-HS:
 
 <p align="center">
   <img src="assets/loss_curves_llama2-7b.png" width="70%" alt="Training loss with and without update scaling">
 </p>
 <p align="center"><em>
-Training loss (EMA) on Llama-2-7B for RaSTA-HS (left) and RaSTA-DM (right), with γ = √ρ (solid)
-and without (dashed). ρ = 1 is identical in both cases.
+Training loss (EMA) for RaSTA-HS (left) and RaSTA-DM (right) at ρ ∈ {1, 2, 4}, with γ = √ρ
+(solid) and without (dashed). ρ = 1 is identical in both cases.
 </em></p>
 
-**Basis sharing and regeneration.** Bases are sampled deterministically from a seed key
-(side, dimension, width) and shared by every layer with the same basis shape. Adapter
-checkpoints store only the learned core plus the seed keys; bases are regenerated (and verified by
-hash) when reloading or merging.
+### Basis construction and sharing
+
+Each basis is sampled with i.i.d. $`\mathcal{N}(0, 1)`$ entries and column-normalized,
+deterministically from a seed key that encodes the basis side, the input or output dimension,
+and the basis width. Every layer that needs the same basis shape uses the same basis. Each layer
+stores only its learned core ($`M`$ or $`s_L, s_R`$) plus the seed keys, and the bases are
+regenerated, and verified by hash, when the adapter is reloaded or merged into $`W`$.
 
 ---
 
 ## Results
 
-Across math, commonsense, code, and GLUE, on Llama-2-7B, Mistral-7B, Llama-3-8B and
-RoBERTa-large, both variants stay competitive with low-rank LoRA and degrade gracefully as the
-budget shrinks. RaSTA-HS is the strongest frozen-basis method at every budget: its ρ = 2
-configuration matches or exceeds RaSTA-DM and LoRA-XS at ρ = 1 with roughly half the parameters.
+We evaluate on mathematical reasoning, commonsense reasoning, code generation, and GLUE, using
+Llama-2-7B, Mistral-7B, Llama-3-8B, and RoBERTa-large. The budgets range from under half of
+rank-one LoRA's parameters down to roughly a tenth. Across this range, both variants stay
+competitive with low-rank LoRA and degrade gracefully as the budget shrinks.
 
 <p align="center">
   <img src="assets/rho_relative_all.png" width="90%" alt="Frozen-basis methods across budgets">
 </p>
 <p align="center"><em>
-Fraction of the best frozen-basis score retained at each budget, per task (normalized within
-each model/task cell, averaged over models). Dashed lines: LoRA r = 1 and VeRA.
+Fraction of the best frozen-basis score each method retains at each budget, normalized within
+each (model, task) cell and averaged over models. Dashed lines: LoRA r = 1 and VeRA.
 </em></p>
 
-**Llama-3-8B, instruction tuning** (accuracy / pass@1; CS = commonsense 8-task average):
-
-| Method | Params | GSM8K | MATH | HumanEval | MBPP | CS Avg. |
-|---|---:|---:|---:|---:|---:|---:|
-| LoRA r = 1 | 2.62M | 71.27 | 21.60 | 46.34 | 67.72 | 85.94 |
-| VeRA V = 1024 | 1.61M | 73.31 | 21.60 | 49.39 | 63.76 | 85.75 |
-| LoRA-XS ρ = 1 | 1.12M | 68.76 | 21.80 | 48.17 | 60.32 | 85.34 |
-| RaSTA-DM ρ = 1 | 1.12M | 69.60 | 19.00 | 46.95 | 62.96 | 84.16 |
-| **RaSTA-HS ρ = 1** | 1.18M | 71.11 | 20.80 | 47.56 | 66.67 | **86.33** |
-| **RaSTA-HS ρ = 2** | 590K | 69.98 | 20.40 | 47.56 | 63.49 | 85.83 |
-| **RaSTA-HS ρ = 4** | 295K | 68.46 | 17.20 | 48.78 | 66.67 | 84.92 |
-
-**RoBERTa-large, GLUE** (8-task average; params exclude the classification head):
-
-| Method | Params | Avg. |
-|---|---:|---:|
-| LoRA r = 1 | 98K | 87.56 |
-| VeRA V = 256 | 61.4K | 85.81 |
-| LoRA-XS ρ = 1 | 49.2K | 86.26 |
-| RaSTA-DM ρ = 1 | 49.2K | 84.91 |
-| **RaSTA-HS ρ = 1** | 49.2K | **87.13** |
-| **RaSTA-HS ρ = 4** | 12.3K | 85.83 |
-
-All numbers are single runs at seed 42; in preliminary multi-seed runs we saw 1–2 point spreads
-on GSM8K, so differences of that size are within run-to-run variation. Full per-model and
-per-dataset tables are in the paper.
+RaSTA-HS is the strongest frozen-basis method at every budget, and its curve is the flattest as
+`ρ` grows. Its `ρ = 2` configuration matches or exceeds RaSTA-DM and LoRA-XS at `ρ = 1`, with
+roughly half the parameters. The dense-mixing methods are the most budget-sensitive. The full
+per-model and per-dataset tables are in the paper.
 
 ---
 
 ## Efficiency
 
-Single optimization step on Mistral-7B (batch 4, bf16 base, fp32 trainable parameters, AdamW;
-median of 30 timed steps after 10 warm-up). "—" = out of memory on an 80 GiB H100.
+RaSTA's cost profile follows from its structure:
 
-| Method | Peak mem @ seq 512 | Step time @ seq 512 | Peak mem @ seq 2048 |
-|---|---:|---:|---:|
-| Full fine-tuning | 67.6 GiB | 208 ms | — |
-| LoRA r = 1 / 8 / 64 | 32.5 / 32.7 / 35.1 GiB | 251 / 274 / 298 ms | — |
-| VeRA V = 1024 | 35.3 GiB | 701 ms | — |
-| LoRA-XS ρ = 1 | 23.4 GiB | 198 ms | 51.6 GiB |
-| RaSTA-DM ρ = 1 | 23.0 GiB | 202 ms | 51.3 GiB |
-| RaSTA-HS ρ = 1 / 2 / 4 | 27.7 / 25.3 / 24.1 GiB | 304 / 241 / 211 ms | 69.3 / 60.2 / 55.6 GiB |
+- **Optimizer state scales with the budget, not the layer.** Gradients and AdamW states exist
+  only for the core, whose size is about $`\sqrt{mn}/\rho`$ per matrix rather than $`r(m+n)`$.
+- **Frozen bases are stored once per shape.** Sharing means one copy of each basis serves every
+  layer of that shape, and none of it enters the checkpoint.
+- **RaSTA-DM's adapter path is narrow.** Inputs are projected to only $`k`$ directions, so the
+  step cost is dominated by the frozen base model and stays nearly flat in `ρ`.
+- **RaSTA-HS's cost scales with $`V`$.** The projection and the $`O(V \log V)`$ transform grow
+  with the subspace width, so raising `ρ` directly lowers its step time and memory. A fused CUDA
+  kernel applies the transform in a single launch.
 
-Both RaSTA variants use less memory than every LoRA and VeRA configuration, and the gap widens
-with workload — the advantage is largest in the long-context, large-batch regime where the memory
-ceiling binds.
+In our profiling, both variants train with lower peak memory than LoRA and VeRA, and the gap
+widens with sequence length and batch size.
 
 <p align="center">
   <img src="assets/memory_len.png" width="32%" alt="Peak memory vs sequence length">
@@ -204,8 +222,9 @@ ceiling binds.
   <img src="assets/time.png" width="32%" alt="Step time vs sequence length">
 </p>
 <p align="center"><em>
-Mistral-7B: peak memory vs. sequence length (batch 4), peak memory vs. batch size (seq 512),
-and step time vs. sequence length (batch 4). Dotted line: 80 GiB ceiling.
+Peak memory vs. sequence length, peak memory vs. batch size, and step time vs. sequence length
+for a single training step (measured on Mistral-7B; the full grid across backbones is in the
+paper's appendix).
 </em></p>
 
 ---
@@ -312,7 +331,7 @@ save_rasta_adapter(model, "my_adapter/", target_modules=target, rho=1.0, variant
 # Later: rebuild from a fresh base model, verify bases, and merge into plain Linear layers.
 base = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1",
                                             torch_dtype=torch.bfloat16)
-merged = load_and_merge_rasta(base, "my_adapter/")   # no inference-time overhead
+merged = load_and_merge_rasta(base, "my_adapter/")   # merged back into plain nn.Linear layers
 ```
 
 Notes:
