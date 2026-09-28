@@ -275,7 +275,88 @@ implementation at first use.
 
 ## Quick start
 
-Each task has a single self-contained driver:
+RaSTA wraps the target `nn.Linear` layers of any model in place. You train the core parameters
+with a standard optimizer, save only those parameters, and later rebuild the adapter from seeds
+and merge it back into plain `nn.Linear` layers.
+
+### 1. Apply the adapter
+
+```python
+import torch
+from transformers import AutoModelForCausalLM
+from rasta import apply_rasta
+
+model = AutoModelForCausalLM.from_pretrained(
+    "mistralai/Mistral-7B-v0.1", torch_dtype=torch.bfloat16
+).cuda()
+
+target = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+model = apply_rasta(
+    model,
+    rho=1.0,              # budget: ~sqrt(m*n)/rho trainable params per adapted matrix
+    variant="hs",         # "hs" = Hadamard scaling, "dm" = dense mixing
+    target_modules=target,
+)
+```
+
+`apply_rasta` replaces each matching layer with a RaSTA adapter, freezes every other parameter,
+and prints the per-layer width and trainable count. The update scale `γ = √ρ` is applied
+automatically. For RaSTA-HS it also checks the fused Walsh–Hadamard kernel on first use and falls
+back to the PyTorch implementation if the kernel is missing.
+
+### 2. Train
+
+Only the cores (`s_L`, `s_R` for RaSTA-HS, `M` for RaSTA-DM) require gradients, so any standard
+training loop or the Hugging Face `Trainer` works unchanged:
+
+```python
+trainable = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.AdamW(trainable, lr=3e-2, weight_decay=0.01)  # RaSTA-HS lr from the paper
+
+model.train()
+for batch in dataloader:  # your tokenized batches with input_ids, attention_mask, labels
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+Base weights stay in bf16 and the trainable cores in fp32 by default (`frozen_dtype`,
+`trainable_dtype`). The paper's learning rates are listed under
+[Reproducing the paper](#reproducing-the-paper).
+
+### 3. Save the adapter
+
+```python
+from rasta import save_rasta_adapter
+
+save_rasta_adapter(model, "my_adapter/", target_modules=target, rho=1.0, variant="hs")
+```
+
+This writes `adapter_weights.pt`, which holds only the learned cores, and `rasta_config.json`,
+which holds the configuration and a hash of every frozen basis. The bases themselves are not
+saved.
+
+### 4. Reload and merge
+
+```python
+from rasta import load_and_merge_rasta
+
+base = AutoModelForCausalLM.from_pretrained(
+    "mistralai/Mistral-7B-v0.1", torch_dtype=torch.bfloat16
+).cuda()
+merged = load_and_merge_rasta(base, "my_adapter/")
+merged.save_pretrained("my_merged_model/")
+```
+
+`load_and_merge_rasta` regenerates the bases from their seeds, checks them against the saved
+hashes, loads the cores, folds `ΔW` into each weight, and returns the model with plain
+`nn.Linear` layers.
+
+## Running the paper's experiments
+
+Each task has a single self-contained driver that trains, merges, and evaluates one
+method/model/config:
 
 ```bash
 bash run_<task>.sh <method> <model> <config> [lr] [seed]
@@ -308,38 +389,8 @@ Hardware knobs are environment variables: `N_GPUS` (default 2, via `torchrun`), 
 (default 128), `PER_DEVICE_BATCH` (default 8; use 4 for RaSTA-HS on 7–8B models). Gradient
 accumulation is derived automatically. The paper's runs fit on a single H100-80GB.
 
-## Using RaSTA in your own code
-
-```python
-import torch
-from transformers import AutoModelForCausalLM
-from rasta import apply_rasta, save_rasta_adapter, load_and_merge_rasta
-
-model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1",
-                                             torch_dtype=torch.bfloat16)
-
-# Wrap target linear layers with RaSTA adapters (freezes everything else).
-target = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-model = apply_rasta(model, rho=1.0, variant="hs", target_modules=target)
-# variant="dm" for the dense-mixing variant; the update scale γ=√ρ is applied automatically.
-
-# ... train the (few) parameters with requires_grad=True ...
-
-# Save only the trained core parameters (+ config and basis hashes) — bases are regenerated.
-save_rasta_adapter(model, "my_adapter/", target_modules=target, rho=1.0, variant="hs")
-
-# Later: rebuild from a fresh base model, verify bases, and merge into plain Linear layers.
-base = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1",
-                                            torch_dtype=torch.bfloat16)
-merged = load_and_merge_rasta(base, "my_adapter/")   # merged back into plain nn.Linear layers
-```
-
-Notes:
-
-- `wht_mode="fused"` (default) uses the CUDA kernel when available and silently falls back to
-  the PyTorch reference otherwise.
-- Bases are cached and shared across layers of compatible shape, so they cost memory once per
-  shape, not once per layer.
+To reproduce the ablation without update scaling, or to use one basis width for every layer,
+`apply_rasta` also accepts `update_scale` and `fixed_V`.
 
 ## Reproducing the paper
 
